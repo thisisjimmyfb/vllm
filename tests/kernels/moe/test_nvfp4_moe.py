@@ -13,6 +13,7 @@ from tests.kernels.quantization.nvfp4_utils import (
 from tests.kernels.utils import torch_moe
 from vllm import _custom_ops as ops
 from vllm.config import ParallelConfig, VllmConfig, set_current_vllm_config
+from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_topk
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.all2all_utils import (
@@ -285,6 +286,129 @@ def test_cutlass_fp4_moe_swiglustep(
         )
 
         torch.testing.assert_close(torch_output, cutlass_output, atol=1e-1, rtol=1e-1)
+
+
+def _route_experts(
+    m: int, e: int, k: int, topk: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build a random routing and return (a_map, expert_offsets,
+    blockscale_offsets), mirroring what CutlassExpertsFp4 does before
+    calling into the per-expert quant kernels."""
+    gating = torch.randn(m, e, device=device)
+    topk_ids = torch.topk(gating, topk, dim=-1).indices.to(torch.int32)
+
+    expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
+    blockscale_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
+    problem_sizes1 = torch.empty((e, 3), dtype=torch.int32, device=device)
+    problem_sizes2 = torch.empty((e, 3), dtype=torch.int32, device=device)
+    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+
+    ops.get_cutlass_moe_mm_data(
+        topk_ids,
+        expert_offsets,
+        problem_sizes1,
+        problem_sizes2,
+        a_map,
+        c_map,
+        e,
+        k,
+        k,
+        blockscale_offsets,
+        is_gated=True,
+    )
+    return a_map, expert_offsets, blockscale_offsets
+
+
+@pytest.mark.parametrize("m,k", [(2, 1024), (64, 1024), (224, 1536)])
+@pytest.mark.parametrize("e", [8, 40])
+@pytest.mark.parametrize("topk", [1, 6])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
+@torch.inference_mode()
+def test_scaled_fp4_experts_quant(
+    m: int, k: int, e: int, topk: int, dtype: torch.dtype
+) -> None:
+    """scaled_fp4_experts_quant (the MoE-experts variant of cvt_fp16_to_fp4)
+    must quantize each expert's rows identically to the dense
+    scaled_fp4_quant kernel applied to that same slice, since both go
+    through the same fp16->fp4 conversion and swizzle math -- they only
+    differ in how rows are addressed (ragged/per-expert vs. flat)."""
+    set_random_seed(1)
+    device = "cuda"
+
+    hidden_states = torch.randn(m, k, device=device, dtype=dtype) / 10
+    a_map, expert_offsets, blockscale_offsets = _route_experts(m, e, k, topk, device)
+    a = ops.shuffle_rows(hidden_states, a_map)
+
+    a_global_scale = torch.rand(e, device=device, dtype=torch.float32) + 0.5
+    out, out_scale = ops.scaled_fp4_experts_quant(
+        a, a_global_scale, expert_offsets, blockscale_offsets, topk
+    )
+
+    for i in range(e):
+        row_lo, row_hi = int(expert_offsets[i]), int(expert_offsets[i + 1])
+        sf_lo, sf_hi = int(blockscale_offsets[i]), int(blockscale_offsets[i + 1])
+        count = row_hi - row_lo
+        if count == 0:
+            continue
+
+        ref_out, ref_scale = ops.scaled_fp4_quant(a[row_lo:row_hi], a_global_scale[i])
+
+        moe_out = out[row_lo:row_hi]
+        moe_scale = out_scale[sf_lo:sf_hi]
+
+        torch.testing.assert_close(moe_out, ref_out)
+        moe_dequant = dequantize_nvfp4_to_dtype(
+            moe_out, moe_scale, a_global_scale[i], dtype, device
+        )
+        ref_dequant = dequantize_nvfp4_to_dtype(
+            ref_out, ref_scale, a_global_scale[i], dtype, device
+        )
+        torch.testing.assert_close(moe_dequant, ref_dequant)
+
+
+@pytest.mark.parametrize("m,k", [(2, 1024), (64, 1024), (224, 1536)])
+@pytest.mark.parametrize("e", [8, 40])
+@pytest.mark.parametrize("topk", [1, 6])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.half])
+@torch.inference_mode()
+def test_silu_and_mul_scaled_fp4_experts_quant(
+    default_vllm_config, m: int, k: int, e: int, topk: int, dtype: torch.dtype
+) -> None:
+    """silu_and_mul_scaled_fp4_experts_quant must match applying SiluAndMul
+    natively followed by the dense scaled_fp4_quant kernel, per expert."""
+    set_random_seed(2)
+    device = "cuda"
+
+    gate_up = torch.randn(m, 2 * k, device=device, dtype=dtype) / 10
+    a_map, expert_offsets, blockscale_offsets = _route_experts(m, e, k, topk, device)
+    a = ops.shuffle_rows(gate_up, a_map)
+
+    a_global_scale = torch.rand(e, device=device, dtype=torch.float32) + 0.5
+    out, out_scale = ops.silu_and_mul_scaled_fp4_experts_quant(
+        a, a_global_scale, expert_offsets, blockscale_offsets, topk
+    )
+
+    for i in range(e):
+        row_lo, row_hi = int(expert_offsets[i]), int(expert_offsets[i + 1])
+        sf_lo, sf_hi = int(blockscale_offsets[i]), int(blockscale_offsets[i + 1])
+        count = row_hi - row_lo
+        if count == 0:
+            continue
+
+        silu_mul_out = SiluAndMul().forward_native(a[row_lo:row_hi])
+        ref_out, ref_scale = ops.scaled_fp4_quant(silu_mul_out, a_global_scale[i])
+
+        moe_out = out[row_lo:row_hi]
+        moe_scale = out_scale[sf_lo:sf_hi]
+
+        moe_dequant = dequantize_nvfp4_to_dtype(
+            moe_out, moe_scale, a_global_scale[i], dtype, device
+        )
+        ref_dequant = dequantize_nvfp4_to_dtype(
+            ref_out, ref_scale, a_global_scale[i], dtype, device
+        )
+        torch.testing.assert_close(moe_dequant, ref_dequant, atol=2e-1, rtol=2e-1)
 
 
 if __name__ == "__main__":

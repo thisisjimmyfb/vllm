@@ -28,6 +28,11 @@
 #include "nvfp4_utils.cuh"
 #include "libtorch_stable/launch_bounds_utils.h"
 
+// Toggle between the original single-element-per-iteration LARGE_M_TOPK
+// loop (0) and the 2-elements-per-iteration, latency-hiding version (1).
+// Flip this to A/B test; both implementations are kept side by side below.
+#define NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION 2
+
 namespace vllm {
 
 // NVFP4 quantization kernel for experts (low-latency path).
@@ -147,6 +152,273 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 // NVFP4 quantization kernel for LARGE_M_TOPK = true (large m_topk optimized
 // version). When FUSE_SILU_MUL=true, expects input with gate||up layout and
 // fuses SiLU(gate)*up before quantization.
+#if NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 2
+// Each thread processes kLoadsPerIteration PackedVec per iteration, with
+// every global load issued before any of them is consumed. This kernel is
+// long-scoreboard/memory-latency bound rather than bandwidth bound (see
+// profiling data in the PR description), so overlapping multiple independent
+// load round trips -- instead of fully serializing load-then-compute per
+// element -- hides more of that latency per stall. kLoadsPerIteration is a
+// plain constexpr, easy to retune.
+template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
+          bool SMALL_NUM_EXPERTS = false>
+__global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
+    cvt_fp16_to_fp4(int32_t numRows, int32_t numCols, Type const* in,
+                    float const* SFScale, uint32_t* out, uint32_t* SFout,
+                    uint32_t* input_offset_by_experts,
+                    uint32_t* output_scale_offset_by_experts, int n_experts) {
+  using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+  // Precompute SF layout parameter (constant for entire kernel).
+  int32_t const numKTiles = (numCols + 63) / 64;
+
+  extern __shared__ uint32_t shared_input_offsets[];
+
+  // Load input offsets into shared memory.
+  // If n_experts is larger than 4, use vectorized int4 to save instructions.
+  // If n_experts is smaller than 4, read directly.
+  if constexpr (SMALL_NUM_EXPERTS) {
+    for (int i = threadIdx.x; i < n_experts + 1; i += blockDim.x) {
+      shared_input_offsets[i] = input_offset_by_experts[i];
+    }
+  } else {
+    for (int i = threadIdx.x * 4; i < n_experts; i += blockDim.x * 4) {
+      *reinterpret_cast<int4*>(&shared_input_offsets[i]) =
+          *reinterpret_cast<const int4*>(&input_offset_by_experts[i]);
+    }
+    if (threadIdx.x == 0) {
+      shared_input_offsets[n_experts] = input_offset_by_experts[n_experts];
+    }
+  }
+
+  __syncthreads();
+
+  int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  // When fusing SiLU+Mul, input has gate || up layout (doubled width)
+  int inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
+
+  constexpr int kLoadsPerIteration = 2;
+
+  // Row -> expert map for the rows the current iteration touches.
+  __shared__ int s_expert[kLoadsPerIteration];
+  __shared__ int s_row_in_expert[kLoadsPerIteration];
+
+  int blocksPerRow = (colsPerRow + blockDim.x - 1) / blockDim.x;
+  int totalBlocks = numRows * blocksPerRow;
+
+  // Iterate on a block-uniform index so every thread reaches
+  // __syncthreads() the same number of times; the partial trailing block of
+  // a row is masked per thread below.
+  for (int blockBase = blockIdx.x; blockBase < totalBlocks;
+       blockBase += kLoadsPerIteration * gridDim.x) {
+    // Candidate rows are block-uniform, so every thread recomputes them in
+    // registers rather than staging them in shared memory. That is what
+    // keeps the map to a single barrier. numRows is a row no expert covers,
+    // so out-of-range loads simply never match.
+    int row[kLoadsPerIteration];
+  #pragma unroll
+    for (int i = 0; i < kLoadsPerIteration; i++) {
+      int b = blockBase + i * gridDim.x;
+      row[i] = b < totalBlocks ? b / blocksPerRow : numRows;
+    }
+
+    // Each thread owns one expert interval and tests it against every
+    // candidate row: one coalesced load and kSlots compares, with no
+    // dependent chain. Intervals are disjoint, so exactly one thread writes
+    // a given slot, and a slot no thread owns is never read -- hence no
+    // initialization.
+    for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+      uint32_t lo = shared_input_offsets[e];
+      uint32_t hi = shared_input_offsets[e + 1];
+  #pragma unroll
+      for (int s = 0; s < kLoadsPerIteration; s++) {
+        uint32_t r = row[s];
+        if (r >= lo && r < hi) {
+          s_expert[s] = e;
+          s_row_in_expert[s] = r - lo;
+        }
+      }
+    }
+    __syncthreads();
+
+    int rowIdx_in_expert[kLoadsPerIteration] = {};
+    int expert_idx[kLoadsPerIteration] = {};
+
+  // Look up the expert
+  #pragma unroll
+    for (int i = 0; i < kLoadsPerIteration; i++) {
+      if (blockBase + i * gridDim.x >= totalBlocks) continue;
+      rowIdx_in_expert[i] = s_row_in_expert[i];
+      expert_idx[i] = s_expert[i];
+    }
+    // Sync here to ensure that all threads have finished reading from shared
+    // memory before we can proceed to the next iteration.
+    __syncthreads();
+
+    // Issue the loads (and their SiLU+Mul up-loads, if fused) back-to-back
+    // before consuming any of them, so their memory latencies overlap
+    // instead of serializing.
+    PackedVec in_vec[kLoadsPerIteration];
+    PackedVec in_vec_up[kLoadsPerIteration];
+  #pragma unroll
+    for (int i = 0; i < kLoadsPerIteration; i++) {
+      int b = blockBase + i * gridDim.x;
+      if (b >= totalBlocks) continue;
+      int rowIdx = row[i];
+      int colIdx = (b % blocksPerRow) * blockDim.x + threadIdx.x;
+      if (colIdx >= colsPerRow) continue;
+
+      int64_t inOffset = rowIdx * inColsPerRow + colIdx;
+      in_vec[i] =
+          LoadPackedVec(reinterpret_cast<PackedVec const*>(in) + inOffset);
+      if constexpr (FUSE_SILU_MUL) {
+        in_vec_up[i] = LoadPackedVec(reinterpret_cast<PackedVec const*>(in) +
+                                     inOffset + colsPerRow);
+      }
+    }
+
+  // Quantize and store every element.
+  #pragma unroll
+    for (int i = 0; i < kLoadsPerIteration; i++) {
+      int b = blockBase + i * gridDim.x;
+      if (b >= totalBlocks) continue;
+      int rowIdx = row[i];
+      int colIdx = (b % blocksPerRow) * blockDim.x + threadIdx.x;
+      if (colIdx >= colsPerRow) continue;
+
+      PackedVec quant_input;
+      if constexpr (FUSE_SILU_MUL) {
+        quant_input = compute_silu_mul(in_vec[i], in_vec_up[i]);
+      } else {
+        quant_input = in_vec[i];
+      }
+
+      float SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx[i]];
+      uint32_t* SFout_in_expert =
+          SFout + output_scale_offset_by_experts[expert_idx[i]] * numKTiles;
+      uint8_t* sf_out =
+          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                             CVT_FP4_NUM_THREADS_PER_SF>(
+              rowIdx_in_expert[i], colIdx, numKTiles, SFout_in_expert);
+
+      int64_t outOffset = rowIdx * colsPerRow + colIdx;
+      out[outOffset] =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+              quant_input, SFScaleVal, sf_out);
+    }
+  }
+}
+#elif NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 1
+// Each global thread processes one element: load, then consume.
+template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
+          bool SMALL_NUM_EXPERTS = false>
+__global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
+    cvt_fp16_to_fp4(int32_t numRows, int32_t numCols, Type const* in,
+                    float const* SFScale, uint32_t* out, uint32_t* SFout,
+                    uint32_t* input_offset_by_experts,
+                    uint32_t* output_scale_offset_by_experts, int n_experts) {
+  using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+  // Precompute SF layout parameter (constant for entire kernel).
+  int32_t const numKTiles = (numCols + 63) / 64;
+
+  extern __shared__ uint32_t shared_input_offsets[];
+
+  // Load input offsets into shared memory.
+  // If n_experts is larger than 4, use vectorized int4 to save instructions.
+  // If n_experts is smaller than 4, read directly.
+  if constexpr (SMALL_NUM_EXPERTS) {
+    for (int i = threadIdx.x; i < n_experts + 1; i += blockDim.x) {
+      shared_input_offsets[i] = input_offset_by_experts[i];
+    }
+  } else {
+    for (int i = threadIdx.x * 4; i < n_experts; i += blockDim.x * 4) {
+      *reinterpret_cast<int4*>(&shared_input_offsets[i]) =
+          *reinterpret_cast<const int4*>(&input_offset_by_experts[i]);
+    }
+    if (threadIdx.x == 0) {
+      shared_input_offsets[n_experts] = input_offset_by_experts[n_experts];
+    }
+  }
+
+  __syncthreads();
+
+  int tid = blockIdx.x * blockDim.x + threadIdx.x;
+  int colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  // When fusing SiLU+Mul, input has gate || up layout (doubled width)
+  int inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
+
+  // Each global thread processes one element
+  for (int globalIdx = tid; globalIdx < numRows * colsPerRow;
+       globalIdx += gridDim.x * blockDim.x) {
+    // Calculate which row and column this global thread should process
+    int rowIdx = globalIdx / colsPerRow;
+    int colIdx = globalIdx % colsPerRow;
+
+    // Find expert using binary search for better performance with large m_topk
+    int rowIdx_in_expert = 0;
+    int expert_idx = 0;
+
+    // Binary search through experts using shared memory
+    int left = 0, right = n_experts - 1;
+    while (left <= right) {
+      int mid = (left + right) / 2;
+      // Get offsets: shared_input_offsets[i] corresponds to
+      // input_offset_by_experts[i]
+      uint32_t mid_offset = shared_input_offsets[mid];
+      uint32_t next_offset = shared_input_offsets[mid + 1];
+
+      if (rowIdx >= mid_offset && rowIdx < next_offset) {
+        rowIdx_in_expert = rowIdx - mid_offset;
+        expert_idx = mid;
+        break;
+      } else if (rowIdx < mid_offset) {
+        right = mid - 1;
+      } else {
+        left = mid + 1;
+      }
+    }
+
+    // Load input and optionally apply fused SiLU+Mul
+    int64_t inOffset = rowIdx * inColsPerRow + colIdx;
+    PackedVec in_vec =
+        LoadPackedVec(reinterpret_cast<PackedVec const*>(in) + inOffset);
+    PackedVec quant_input;
+    if constexpr (FUSE_SILU_MUL) {
+      PackedVec in_vec_up = LoadPackedVec(
+          reinterpret_cast<PackedVec const*>(in) + inOffset + colsPerRow);
+      quant_input = compute_silu_mul(in_vec, in_vec_up);
+    } else {
+      quant_input = in_vec;
+    }
+
+    int64_t outOffset = rowIdx * colsPerRow + colIdx;
+    auto& out_pos = out[outOffset];
+
+    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[expert_idx];
+
+    uint32_t* SFout_in_expert =
+        SFout + output_scale_offset_by_experts[expert_idx] * numKTiles;
+
+    auto sf_out =
+        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                           CVT_FP4_NUM_THREADS_PER_SF>(
+            rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
+
+    out_pos = cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+        quant_input, SFScaleVal, sf_out);
+  }
+}
+#else
+// Each global thread processes one element: load, then consume.
 template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
           bool SMALL_NUM_EXPERTS = false>
 __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
@@ -249,6 +521,7 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
         quant_input, SFScaleVal, sf_out);
   }
 }
+#endif  // NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION
 
 template <typename T, bool FUSE_SILU_MUL = false>
 void quant_impl(void* output, void* output_scale, void* input,

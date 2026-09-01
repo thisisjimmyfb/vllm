@@ -361,4 +361,16 @@ __device__ __forceinline__ packed_t packed_mul(const packed_t& x,
   }
 }
 
+template <class Type, bool use_256b>
+__device__ __forceinline__ PackedVec<Type, use_256b> LoadPackedVec(
+    const PackedVec<Type, use_256b>* ptr) {
+  PackedVec<Type, use_256b> ret;
+  if constexpr (use_256b) {
+    ld256(ret, ptr);
+  } else {
+    ld128(ret, ptr);
+  }
+  return ret;
+}
+
 }  // namespace vllm
