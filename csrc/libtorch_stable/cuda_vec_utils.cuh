@@ -366,7 +366,14 @@ __device__ __forceinline__ PackedVec<Type, use_256b> LoadPackedVec(
     const PackedVec<Type, use_256b>* ptr) {
   PackedVec<Type, use_256b> ret;
   if constexpr (use_256b) {
+#if VLLM_256B_PTX_ENABLED
     ld256(ret, ptr);
+#else
+    ld128(reinterpret_cast<PackedVec<Type, false>*>(&ret)[0],
+          reinterpret_cast<const PackedVec<Type, false>*>(ptr)[0]);
+    ld128(reinterpret_cast<PackedVec<Type, false>*>(&ret)[1],
+          reinterpret_cast<const PackedVec<Type, false>*>(ptr)[1]);
+#endif
   } else {
     ld128(ret, ptr);
   }
