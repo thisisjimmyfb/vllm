@@ -218,6 +218,10 @@ __device__ __forceinline__ int ld32(const int* addr) { return __ldg(addr); }
 
 __device__ __forceinline__ void st32(int* addr, int val) { *addr = val; }
 
+__device__ __forceinline__ void st64(int64_t* addr, int64_t val) {
+  *addr = val;
+}
+
 // 32-bit cache-streaming (.cs) load / store.
 // Falls back to ld32/st32 on ROCm (no .cs hint).
 __forceinline__ __device__ int ld32_cs(const int* addr) {
@@ -235,6 +239,14 @@ __forceinline__ __device__ void st32_cs(int* addr, int val) {
   asm volatile("st.global.cs.b32 [%0], %1;" ::"l"(addr), "r"(val));
 #else
   st32(addr, val);
+#endif
+}
+
+__forceinline__ __device__ void st64_cs(int64_t* addr, int64_t val) {
+#ifndef USE_ROCM
+  asm volatile("st.global.cs.b64 [%0], %1;" ::"l"(addr), "l"(val));
+#else
+  st64(addr, val);
 #endif
 }
 
@@ -360,24 +372,4 @@ __device__ __forceinline__ packed_t packed_mul(const packed_t& x,
     return make_float2(x.x * y.x, x.y * y.y);
   }
 }
-
-template <class Type, bool use_256b>
-__device__ __forceinline__ PackedVec<Type, use_256b> LoadPackedVec(
-    const PackedVec<Type, use_256b>* ptr) {
-  PackedVec<Type, use_256b> ret;
-  if constexpr (use_256b) {
-#if VLLM_256B_PTX_ENABLED
-    ld256(ret, ptr);
-#else
-    ld128(reinterpret_cast<PackedVec<Type, false>*>(&ret)[0],
-          reinterpret_cast<const PackedVec<Type, false>*>(ptr)[0]);
-    ld128(reinterpret_cast<PackedVec<Type, false>*>(&ret)[1],
-          reinterpret_cast<const PackedVec<Type, false>*>(ptr)[1]);
-#endif
-  } else {
-    ld128(ret, ptr);
-  }
-  return ret;
-}
-
 }  // namespace vllm
