@@ -28,7 +28,26 @@
 #include "nvfp4_utils.cuh"
 #include "libtorch_stable/launch_bounds_utils.h"
 
+// Toggle between the original single-element-per-iteration LARGE_M_TOPK
+// loop (0) and the 2-elements-per-iteration, latency-hiding version (1).
+// Flip this to A/B test; both implementations are kept side by side below.
+#define NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION 2
+
 namespace vllm {
+
+// Load one packed vector from global memory, using the 256b streaming load
+// where it is available.
+template <class PackedVecT>
+__device__ __forceinline__ PackedVecT LoadPackedVec(PackedVecT const* ptr) {
+  if constexpr (VLLM_256B_PTX_ENABLED &&
+                sizeof(PackedVecT) == sizeof(u32x8_t)) {
+    PackedVecT vec;
+    ld256(vec, ptr);
+    return vec;
+  } else {
+    return *ptr;
+  }
+}
 
 // NVFP4 quantization kernel for experts (low-latency path).
 // When FUSE_SILU_MUL=true, expects input with gate||up layout and fuses
@@ -150,6 +169,216 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 // NVFP4 quantization kernel for LARGE_M_TOPK = true (large m_topk optimized
 // version). When FUSE_SILU_MUL=true, expects input with gate||up layout and
 // fuses SiLU(gate)*up before quantization.
+#if NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 2
+template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
+          bool SMALL_NUM_EXPERTS = false>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4(int32_t numRows, int32_t numCols, Type const* in,
+                    float const* SFScale, uint32_t* out, uint32_t* SFout,
+                    uint32_t* input_offset_by_experts,
+                    uint32_t* output_scale_offset_by_experts, int n_experts) {
+  // because of the scale factor based indexing scheme, we will always need to
+  // load 256bits of data for each SF, therefore we just define a packed vector
+  // of 16 elements (256bits) to load/store data
+  using PackedVec16 = PackedVec<Type, true>;
+  static_assert(PackedVec16::NUM_ELTS * 2 == 16,
+                "PackedVec16 must have 8 elements.");
+
+  extern __shared__ __align__(16) uint32_t shared_memory[];
+  uint32_t* shared_input_offsets = shared_memory;
+  uint32_t* shared_output_scale_offsets =
+      shared_memory + round_up(n_experts + 1, 4);
+  float* shared_SFScale =
+      reinterpret_cast<float*>(shared_memory + round_up(n_experts + 1, 4) * 2);
+
+  // Load output offsets into shared memory.
+  // If n_experts is larger than 4, use vectorized int4 to save instructions.
+  // If n_experts is smaller than 4, read directly.
+  if constexpr (SMALL_NUM_EXPERTS) {
+    for (int i = threadIdx.x; i < n_experts; i += blockDim.x) {
+      shared_input_offsets[i] = input_offset_by_experts[i];
+      shared_output_scale_offsets[i] = output_scale_offset_by_experts[i];
+      shared_SFScale[i] = SFScale == nullptr ? 1.0f : SFScale[i];
+    }
+    if (threadIdx.x == 0) {
+      shared_input_offsets[n_experts] = input_offset_by_experts[n_experts];
+      shared_output_scale_offsets[n_experts] =
+          output_scale_offset_by_experts[n_experts];
+    }
+  } else {
+    for (int i = threadIdx.x * 4; i < n_experts; i += blockDim.x * 4) {
+      *reinterpret_cast<int4*>(&shared_input_offsets[i]) =
+          *reinterpret_cast<const int4*>(&input_offset_by_experts[i]);
+      *reinterpret_cast<int4*>(&shared_output_scale_offsets[i]) =
+          *reinterpret_cast<const int4*>(&output_scale_offset_by_experts[i]);
+      *reinterpret_cast<float4*>(&shared_SFScale[i]) =
+          SFScale == nullptr ? make_float4(1.0f, 1.0f, 1.0f, 1.0f)
+                             : *reinterpret_cast<const float4*>(&SFScale[i]);
+    }
+    if (threadIdx.x == 0) {
+      shared_input_offsets[n_experts] = input_offset_by_experts[n_experts];
+      shared_output_scale_offsets[n_experts] =
+          output_scale_offset_by_experts[n_experts];
+    }
+  }
+
+  __syncthreads();
+
+  uint32_t numValidRows = shared_output_scale_offsets[n_experts];
+  // Precompute SF layout parameter (constant for entire kernel).
+  uint32_t const numKTiles = (numCols + 63) / 64;
+  uint32_t const numMTiles = (numValidRows + 127) / 128;
+  uint32_t const numTotalTiles = numMTiles * numKTiles;
+
+  // assign tiles to warps
+  uint32_t tilesPerBlock = (numTotalTiles + gridDim.x - 1) / gridDim.x;
+  uint32_t tileBegin = blockIdx.x * tilesPerBlock;
+  uint32_t tileEnd = min(tileBegin + tilesPerBlock, numTotalTiles);
+  uint32_t warpIdx = threadIdx.x / warpSize;
+  uint32_t warpsPerBlock = (blockDim.x + warpSize - 1) / warpSize;
+
+  uint32_t* shared_tile2expert = shared_memory + round_up(n_experts + 1, 4) * 3;
+  uint32_t tileMBegin = tileBegin / numKTiles;
+  uint32_t tileMEnd = (tileEnd - 1) / numKTiles;
+
+  for (int e = threadIdx.x; e < n_experts; e += blockDim.x) {
+    int tileMBase = max(output_scale_offset_by_experts[e] >> 7, tileMBegin);
+    int tileMNext =
+        min(output_scale_offset_by_experts[e + 1] >> 7, tileMEnd + 1);
+    for (int t = tileMBase; t < tileMNext; ++t) {
+      shared_tile2expert[t - tileMBegin] = e;
+    }
+  }
+
+  __syncthreads();
+
+  int colsPerRow = numCols / 16;
+  // When fusing SiLU+Mul, input has gate || up layout (doubled width)
+  int inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
+  int sfColsPerRow = numCols / 16;
+
+  // loop through consecutive tiles
+  for (int tileIdx = tileBegin + warpIdx; tileIdx < tileEnd;
+       tileIdx += warpsPerBlock) {
+    int mTileIdx = tileIdx / numKTiles;
+    int kTileIdx = tileIdx % numKTiles;
+    int mBase = mTileIdx << 7;
+    int kBase = kTileIdx << 2;
+
+    // look up expert id using tile index
+    int expert_idx = shared_tile2expert[mTileIdx - tileMBegin];
+    float SFScaleVal = shared_SFScale[expert_idx];
+    int input_offset[2];
+    input_offset[0] = shared_input_offsets[expert_idx];
+    input_offset[1] = shared_input_offsets[expert_idx + 1];
+    int sf_output_offset = shared_output_scale_offsets[expert_idx];
+
+    int validRows = min(
+        128, input_offset[1] - input_offset[0] - (mBase - sf_output_offset));
+
+    // each warp need to process one tile (512 SFs)
+    for (int sfIdx = threadIdx.x & (warpSize - 1); sfIdx < validRows * 4;
+         sfIdx += warpSize) {
+      int mIdx = mBase + (sfIdx >> 2);
+      int kIdx = kBase + (sfIdx & 3);
+      // mIdx and kIdx are in the range of the current tile, but we need the
+      // rowIdx from the input tensor which are not padded to 128 per expert,
+      // that's why we need to do this math.
+      int rowIdx = input_offset[0] + (mIdx - sf_output_offset);
+
+      bool valid = kIdx < colsPerRow;
+
+      if (valid) {
+        // Load input and optionally apply fused SiLU+Mul
+        PackedVec16 in_vec;
+        PackedVec16 in_vec_up;
+        int inOffset = rowIdx * inColsPerRow + kIdx;
+        in_vec =
+            LoadPackedVec(reinterpret_cast<PackedVec16 const*>(in) + inOffset);
+        if constexpr (FUSE_SILU_MUL) {
+          in_vec_up = LoadPackedVec(reinterpret_cast<PackedVec16 const*>(in) +
+                                    colsPerRow + inOffset);
+        }
+
+        // Quantize and store every element.
+        PackedVec16 quant_input;
+        if constexpr (FUSE_SILU_MUL) {
+          quant_input = compute_silu_mul(in_vec, in_vec_up);
+        } else {
+          quant_input = in_vec;
+        }
+
+        // uint8_t* sf_out = reinterpret_cast<uint8_t*>(SFout) + tileIdx * 512 +
+        // threadIdx.x * 4;
+        int mLocal = sfIdx >> 2, kLocal = sfIdx & 3;
+        uint8_t* sf_out = reinterpret_cast<uint8_t*>(SFout) +
+                          (int64_t)tileIdx * 512 + ((mLocal & 31) << 4) +
+                          (((mLocal >> 5) & 3) << 2) + kLocal;
+
+        uint64_t out_val = cvt_warp_fp16_to_uint64<Type, UE8M0_SF>(
+            quant_input, SFScaleVal, sf_out);
+
+        int64_t outOffset = rowIdx * colsPerRow + kIdx;
+        reinterpret_cast<uint64_t*>(out)[outOffset] = out_val;
+      }
+    }
+  }
+}
+
+template <typename T, bool FUSE_SILU_MUL = false>
+void quant_impl(void* output, void* output_scale, void* input,
+                void* input_global_scale, void* input_offset_by_experts,
+                void* output_scale_offset_by_experts, int m_topk, int k,
+                int n_experts, cudaStream_t stream) {
+  int multiProcessorCount =
+      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
+
+  // Grid, Block size.
+  // Each warp work on a tile and converts 512 values
+  int const workSizePerRow = ((k + 63) / 64) * 32;
+  dim3 block(std::min(workSizePerRow, 512));
+  int const rowTiles = (m_topk + 127) / 128 + std::min(n_experts, m_topk);
+  dim3 grid(
+      std::min((rowTiles * workSizePerRow + (int)block.x - 1) / (int)block.x,
+               multiProcessorCount * vllm_runtime_blocks_per_sm(block.x)));
+
+  int32_t const maxKTiles = (k + 63) / 64;
+  int32_t const maxMTiles = (m_topk + 127) / 128;
+  int32_t const maxTotalTiles = maxMTiles * maxKTiles;
+
+  int const tilesPerBlock = (maxTotalTiles + (int)grid.x - 1) / (int)grid.x;
+  int const maxWindow = tilesPerBlock / maxKTiles + 2;
+
+  size_t shared_mem_size = 2 * round_up(n_experts + 1, 4) * sizeof(uint32_t) +
+                           round_up(n_experts + 1, 4) * sizeof(float) +
+                           maxWindow * sizeof(uint32_t);
+
+  // The shared-memory vectorized offset load only handles full 4-expert
+  // chunks. Use the scalar specialization for the remainder cases.
+  if (n_experts >= 4 && n_experts % 4 == 0) {
+    cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, false>
+        <<<grid, block, shared_mem_size, stream>>>(
+            m_topk, k, reinterpret_cast<T*>(input),
+            reinterpret_cast<float*>(input_global_scale),
+            reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(output_scale),
+            reinterpret_cast<uint32_t*>(input_offset_by_experts),
+            reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+            n_experts);
+  } else {
+    cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false, true>
+        <<<grid, block, shared_mem_size, stream>>>(
+            m_topk, k, reinterpret_cast<T*>(input),
+            reinterpret_cast<float*>(input_global_scale),
+            reinterpret_cast<uint32_t*>(output),
+            reinterpret_cast<uint32_t*>(output_scale),
+            reinterpret_cast<uint32_t*>(input_offset_by_experts),
+            reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
+            n_experts);
+  }
+}
+#else
+// Each global thread processes one element: load, then consume.
 template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
           bool SMALL_NUM_EXPERTS = false>
 __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
@@ -331,6 +560,7 @@ void quant_impl(void* output, void* output_scale, void* input,
     }
   }
 }
+#endif  // NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION
 
 }  // namespace vllm
 

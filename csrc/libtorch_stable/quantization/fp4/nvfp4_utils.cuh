@@ -32,7 +32,8 @@ constexpr int CVT_FP4_ELTS_PER_THREAD = 16;
   #define CVT_FP4_PACK16 0
 constexpr int CVT_FP4_ELTS_PER_THREAD = 8;
 #endif
-
+static_assert(16 % CVT_FP4_ELTS_PER_THREAD == 0,
+              "CVT_FP4_ELTS_PER_THREAD must be divisible by 16");
 constexpr int CVT_FP4_SF_VEC_SIZE = 16;
 
 namespace vllm {
@@ -216,6 +217,84 @@ __device__ __forceinline__ uint8_t* sf_out_rowmajor_u8(int row, int pack,
   return (uint8_t*)SFout + off;
 }
 
+// Quantizes the provided PackedVec into uint64_t output
+template <class Type, bool UE8M0_SF = false>
+__device__ __forceinline__ uint64_t cvt_warp_fp16_to_uint64(
+    PackedVec<Type, true>& vec, float SFScaleVal, uint8_t* SFout) {
+  auto localMax = __habs2(vec.elts[0]);
+
+  // Local maximum value.
+#pragma unroll
+  for (int i = 1; i < PackedVec<Type, true>::NUM_ELTS; i++) {
+    localMax = __hmax2(localMax, __habs2(vec.elts[i]));
+  }
+
+  // Get the final absolute maximum values.
+  float vecMax = float(__hmax(localMax.x, localMax.y));
+
+  // 8 bits representation of the SF.
+  float SFValue;
+  uint8_t fp8SFVal;
+
+  if constexpr (UE8M0_SF) {
+    // OCP MX spec E8M0 scale computation (MXFP4 path):
+    // scale_exp = biased_exponent(round_up(vecMax)) - 2
+    //   -2 because max E2M1 value is 6.0 ≈ 2^2.58; we use 2^2=4 as the
+    //   safe divisor so that max_val / scale <= 6.0 for values near 2^n.
+    uint32_t max_bits = __float_as_uint(vecMax);
+    // Add rounding bias at mantissa bit 21 (equivalent to bf16 val_to_add=32
+    // at bit 5). Threshold: values with mantissa >= 0.75 (i.e. >= 1.75*2^n)
+    // round up to the next power of 2.
+    uint32_t rounded_bits = (max_bits + (1u << 21)) & 0xFF800000u;
+    uint32_t biased_exp = (rounded_bits >> 23) & 0xFFu;
+    uint32_t scale_exp = (biased_exp > 2u) ? (biased_exp - 2u) : 0u;
+    scale_exp = min(scale_exp, 254u);
+    fp8SFVal = static_cast<uint8_t>(scale_exp);
+    // Reconstruct scale as float32: scale = 2^(scale_exp - 127)
+    uint32_t sf_bits = scale_exp << 23;
+    SFValue = __uint_as_float(sf_bits);
+  } else {
+    // NVFP4 path: scale = max / 6.0, stored as E4M3.
+    SFValue = SFScaleVal * (vecMax * reciprocal_approximate_ftz(6.0f));
+    // Here SFValue is always positive, so E4M3 is the same as UE4M3.
+    __nv_fp8_e4m3 tmp = __nv_fp8_e4m3(SFValue);
+    reinterpret_cast<__nv_fp8_e4m3&>(fp8SFVal) = tmp;
+    // Convert back to fp32.
+    SFValue = float(tmp);
+  }
+
+  // Write the SF to global memory (STG.8).
+  if (SFout) *SFout = fp8SFVal;
+
+  // Get the output scale (= 1 / SFValue for the MXFP4/UE8M0 path where
+  // SFScaleVal=1).  Use exact division for UE8M0 to ensure bit-exact scaling
+  // that matches the reference QDQ implementation (dividing by a power-of-2
+  // scale is exact in IEEE 754).
+  float outputScale;
+  if constexpr (UE8M0_SF) {
+    // SFValue is always a power of 2 for UE8M0, so 1/SFValue is exact.
+    outputScale = SFValue != 0.0f ? (1.0f / SFValue) : 0.0f;
+  } else {
+    // NVFP4 path: use fast approximate reciprocal (original behavior).
+    outputScale = SFValue != 0.0f
+                      ? reciprocal_approximate_ftz(
+                            SFValue * reciprocal_approximate_ftz(SFScaleVal))
+                      : 0.0f;
+  }
+
+  // Convert the input to float.
+  float2 fp2Vals[PackedVec<Type, true>::NUM_ELTS];
+#pragma unroll
+  for (int i = 0; i < PackedVec<Type, true>::NUM_ELTS; i++) {
+    fp2Vals[i] = cast_to_float2(vec.elts[i]);
+    fp2Vals[i].x *= outputScale;
+    fp2Vals[i].y *= outputScale;
+  }
+  u32x2 packed = pack_fp4(fp2Vals);
+  return (static_cast<uint64_t>(packed.hi) << 32) |
+         static_cast<uint64_t>(packed.lo);
+}
+
 // Quantizes the provided PackedVec into the uint32_t output
 template <class Type, int CVT_FP4_NUM_THREADS_PER_SF, bool UE8M0_SF = false>
 __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
@@ -310,14 +389,14 @@ __device__ __forceinline__ float2 silu2(float2 x) {
   return make_float2(silu(x.x), silu(x.y));
 }
 
-template <class Type>
-__inline__ __device__ PackedVec<Type, CVT_FP4_PACK16> compute_silu_mul(
-    const PackedVec<Type, CVT_FP4_PACK16>& x_vec,
-    const PackedVec<Type, CVT_FP4_PACK16>& y_vec) {
-  PackedVec<Type, CVT_FP4_PACK16> result;
+template <class Type, bool use_256b>
+__inline__ __device__ PackedVec<Type, use_256b> compute_silu_mul(
+    const PackedVec<Type, use_256b>& x_vec,
+    const PackedVec<Type, use_256b>& y_vec) {
+  PackedVec<Type, use_256b> result;
 
 #pragma unroll
-  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; ++i) {
+  for (int i = 0; i < PackedVec<Type, use_256b>::NUM_ELTS; ++i) {
     // silu_mul in float32
     using packed_t = typename PackedTypeConverter<Type>::Type;
     float2 silu_vec = silu2(cast_to_float2(x_vec.elts[i]));
