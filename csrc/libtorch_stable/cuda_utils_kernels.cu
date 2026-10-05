@@ -1,22 +1,33 @@
 #include "cuda_utils.h"
+#include <cstdint>
+#include <mutex>
+#include <unordered_map>
 #ifdef USE_ROCM
   #include <hip/hip_runtime.h>
   #include <hip/hip_runtime_api.h>
 #endif
 
 int64_t get_device_attribute(int64_t attribute, int64_t device_id) {
-  // Return the cached value on subsequent calls
-  static int value = [=]() {
-    int device = static_cast<int>(device_id);
-    if (device < 0) {
-      CUDA_CHECK(cudaGetDevice(&device));
-    }
-    int value;
-    CUDA_CHECK(cudaDeviceGetAttribute(
-        &value, static_cast<cudaDeviceAttr>(attribute), device));
-    return static_cast<int>(value);
-  }();
+  int device = static_cast<int>(device_id);
+  if (device < 0) {
+    CUDA_CHECK(cudaGetDevice(&device));
+  }
 
+  // Cached per (device, attribute), shared by all threads.
+  static std::mutex mutex;
+  static std::unordered_map<int64_t, int> cache;
+  int64_t const key =
+      (static_cast<int64_t>(device) << 32) | static_cast<uint32_t>(attribute);
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = cache.find(key);
+  if (it != cache.end()) {
+    return it->second;
+  }
+
+  int value;
+  CUDA_CHECK(cudaDeviceGetAttribute(
+      &value, static_cast<cudaDeviceAttr>(attribute), device));
+  cache.emplace(key, value);
   return value;
 }
 
