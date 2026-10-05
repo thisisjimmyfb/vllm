@@ -216,10 +216,12 @@ __device__ __forceinline__ uint8_t* sf_out_rowmajor_u8(int row, int pack,
   return (uint8_t*)SFout + off;
 }
 
-// Quantizes the provided PackedVec into the uint32_t output
-template <class Type, int CVT_FP4_NUM_THREADS_PER_SF, bool UE8M0_SF = false>
-__device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
-    PackedVec<Type, CVT_FP4_PACK16>& vec, float SFScaleVal, uint8_t* SFout) {
+// Quantizes the provided PackedVec, handing the scale factor back in fp8SFVal
+// instead of storing it. The two public forms below differ only in how they
+// write that byte out.
+template <class Type, int CVT_FP4_NUM_THREADS_PER_SF, bool UE8M0_SF>
+__device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4_and_sf(
+    PackedVec<Type, CVT_FP4_PACK16>& vec, float SFScaleVal, uint8_t& fp8SFVal) {
   // Get absolute maximum values among the local 8 values.
   auto localMax = __habs2(vec.elts[0]);
 
@@ -239,7 +241,6 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
 
   // 8 bits representation of the SF.
   float SFValue;
-  uint8_t fp8SFVal;
 
   if constexpr (UE8M0_SF) {
     // OCP MX spec E8M0 scale computation (MXFP4 path):
@@ -286,6 +287,31 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
 
   float2 const outputScale2 = make_float2(outputScale, outputScale);
 
+#if CVT_FP4_PACK16
+  // Scale and pack one half at a time. fp32_vec16_to_e2m1 takes all sixteen
+  // floats as asm operands at once, so packing in one go forces eight float2
+  // (16 registers) live simultaneously where four suffice. Same instructions in
+  // the same order, half the peak liveness.
+  u32x2 packed;
+  {
+    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 4];
+  #pragma unroll
+    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 4; i++) {
+      fp2Vals[i] = __fmul2_rn(cast_to_float2(vec.elts[i]), outputScale2);
+    }
+    packed.lo = fp32_vec8_to_e2m1(fp2Vals);
+  }
+  {
+    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 4];
+  #pragma unroll
+    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 4; i++) {
+      fp2Vals[i] = __fmul2_rn(
+          cast_to_float2(vec.elts[i + CVT_FP4_ELTS_PER_THREAD / 4]), outputScale2);
+    }
+    packed.hi = fp32_vec8_to_e2m1(fp2Vals);
+  }
+  return packed;
+#else
   // Convert the input to float.
   float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
 
@@ -294,8 +320,19 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
     fp2Vals[i] = __fmul2_rn(cast_to_float2(vec.elts[i]), outputScale2);
   }
 
-  // Convert to e2m1 values.
-  fp4_packed_t const packed = pack_fp4(fp2Vals);
+  return pack_fp4(fp2Vals);
+#endif
+}
+
+// Quantizes the provided PackedVec into the uint32_t output, storing the scale
+// factor as a single byte (STG.8).
+template <class Type, int CVT_FP4_NUM_THREADS_PER_SF, bool UE8M0_SF = false>
+__device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
+    PackedVec<Type, CVT_FP4_PACK16>& vec, float SFScaleVal, uint8_t* SFout) {
+  uint8_t fp8SFVal;
+  fp4_packed_t const packed =
+      cvt_warp_fp16_to_fp4_and_sf<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+          vec, SFScaleVal, fp8SFVal);
 
   // Write the SF to global memory (STG.8). This comes after packing: the
   // store needs its 64-bit address live, which before packing would be on top

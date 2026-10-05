@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-// Experts quantization kernel version: 0 for the original kernels or v1
-// (one-wave grid-stride). Flip this to A/B test; both are kept side by side
-// below.
+// Experts quantization kernel version: 0 for the original kernels, or v1
+// (one-wave grid-stride) or v2 (per-tile, staged SF writes). Flip this to A/B
+// test; all versions are kept side by side below.
 #define NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION 1
 #if NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION > 0
   #define NVFP4_ENABLE_ELTS16
@@ -38,6 +38,11 @@
 #include "../../../cuda_compat.h"
 
 #define CVT_FP4_MAX_THREADS_PER_BLOCK (512)
+// SF swizzle tile: 128 rows x 4 SFs (64 columns), stored as 512 contiguous
+// bytes.
+#define CVT_FP4_SF_TILE_ROWS (128)
+#define CVT_FP4_SF_TILE_COLS (64)
+#define CVT_FP4_SF_TILE_BYTES (512)
 // Fewest experts for which the per-expert tables are staged in shared memory.
 // The lookup only bounds kernel time below one full wave, as a full wave keeps
 // enough loads in flight to stay bandwidth-bound, and there it overlaps the
@@ -218,7 +223,215 @@ std::pair<int, int> one_wave_launch_dims(Kernel kernel, int64_t work_items,
 // NVFP4 quantization kernel for LARGE_M_TOPK = true (large m_topk optimized
 // version). When FUSE_SILU_MUL=true, expects input with gate||up layout and
 // fuses SiLU(gate)*up before quantization.
-#if NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 1
+#if NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 2
+// Blocks grid-stride over tiles of 128 consecutive input rows by one
+// 64-column K chunk. Tiles ignore expert boundaries, so every tile but the last
+// row of tiles is full however small the experts are, and each thread looks up
+// the expert of its own row for every tile. Padding rows are never visited.
+template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false>
+__global__ void __launch_bounds__(
+    CVT_FP4_MAX_THREADS_PER_BLOCK,
+    VLLM_BLOCKS_PER_SM(CVT_FP4_MAX_THREADS_PER_BLOCK))
+    cvt_fp16_to_fp4(int32_t numRows, int32_t numCols,
+                    Type const* __restrict__ in,
+                    float const* __restrict__ SFScale,
+                    uint32_t* __restrict__ out, uint32_t* __restrict__ SFout,
+                    uint32_t* __restrict__ input_offset_by_experts,
+                    uint32_t* __restrict__ output_scale_offset_by_experts,
+                    int n_experts) {
+  using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+  static_assert(
+      CVT_FP4_NUM_THREADS_PER_SF == 1,
+      "CVT_FP4_NUM_THREADS_PER_SF should be 1 with NVFP4_ENABLE_ELTS16");
+  static constexpr int kVecsPerKTile =
+      CVT_FP4_SF_TILE_COLS / CVT_FP4_ELTS_PER_THREAD;
+  static_assert(kVecsPerKTile == 4);
+
+  // Precompute SF layout parameter (constant for entire kernel).
+  int32_t const numKTiles = (numCols + 63) / 64;
+  int const colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+  // When fusing SiLU+Mul, input has gate || up layout (doubled width)
+  int const inColsPerRow = FUSE_SILU_MUL ? colsPerRow * 2 : colsPerRow;
+
+  PackedVec const* const in_vecs = reinterpret_cast<PackedVec const*>(in);
+
+  // Every thread looks up an expert for every tile it works on, so the
+  // per-expert tables are staged in shared memory once per block; reading
+  // them from global memory would issue more sectors than the tile's input.
+  extern __shared__ __align__(16) uint32_t shared_expert_tables[];
+  int const table_stride = expert_table_stride(n_experts);
+  uint32_t* const input_offsets = shared_expert_tables;
+  uint32_t* const output_scale_offset = shared_expert_tables + table_stride;
+  float* const sf_scales =
+      reinterpret_cast<float*>(shared_expert_tables + 2 * table_stride);
+  load_expert_tables(input_offsets, output_scale_offset, sf_scales,
+                     input_offset_by_experts, output_scale_offset_by_experts,
+                     SFScale, n_experts);
+  __syncthreads();
+
+  // The tile's SFs, one 32-bit word (a row's four K SFs) per row, each row's
+  // destination word in SFout, and the first row's row within its expert.
+  // Row r is kept in slot (r % 32) * 4 + r / 32, the SF tile's own order: the
+  // write-out reads rows 32 apart from adjacent lanes, which in row order
+  // would share a bank.
+  __shared__ uint32_t tile_sf_words[CVT_FP4_SF_TILE_ROWS];
+  __shared__ uint32_t tile_sf_dst[CVT_FP4_SF_TILE_ROWS];
+  __shared__ int tile_first_row_in_expert;
+  uint8_t* const tile_sf_bytes = reinterpret_cast<uint8_t*>(tile_sf_words);
+  static constexpr int kInnerRowStride = CVT_FP4_SF_TILE_ROWS / 4;
+
+  int const numValidRows =
+      min(numRows, static_cast<int>(input_offsets[n_experts]));
+  int const numMTiles = div_round_up(numValidRows, CVT_FP4_SF_TILE_ROWS);
+  int const numTiles = numMTiles * numKTiles;
+
+  // A thread's rows only advance, so its expert is carried across tiles.
+  int expert_idx = 0;
+
+  // Whether a thread's lookups after its block's first tile gallop (see
+  // search_expert). A block's tiles run in order from the start of the rows to
+  // past the end, so over its N tiles a thread crosses about all
+  // n = n_experts expert boundaries, a mean jump of d = n / N experts per
+  // lookup. Galloping wins below d = sqrt(n / 2):
+  //   n / N < sqrt(n / 2)  <=>  n^2 / N^2 < n / 2  <=>  N^2 > 2 * n.
+  // The first tile's lookup starts from expert 0, about n / 2 experts short of
+  // its row, so it always bisects.
+  int const N = div_round_up(numTiles, static_cast<int>(gridDim.x));
+  bool const search_use_gallop = (int64_t)N * N > 2 * n_experts;
+
+  // K chunks are the fast tile dimension, so blocks working at the same time
+  // read consecutive 128B segments of the same rows.
+  for (int tile = blockIdx.x; tile < numTiles; tile += gridDim.x) {
+    int const colBegin = tile % numKTiles * kVecsPerKTile;
+    int const rowBegin = tile / numKTiles * CVT_FP4_SF_TILE_ROWS;
+    int const tileRows = min(CVT_FP4_SF_TILE_ROWS, numValidRows - rowBegin);
+    int const tileVecs = tileRows * kVecsPerKTile;
+
+    for (int idx = threadIdx.x; idx < tileVecs; idx += blockDim.x) {
+      int const rowInTile = idx / kVecsPerKTile;
+      int const colIdx = colBegin + idx % kVecsPerKTile;
+      // The last K chunk is partial when K is not a multiple of 64.
+      if (colIdx >= colsPerRow) {
+        continue;
+      }
+      int const rowIdx = rowBegin + rowInTile;
+      int64_t const inOffset = (int64_t)rowIdx * inColsPerRow + colIdx;
+
+      // The input is loaded before the expert lookup so the lookup overlaps it.
+      PackedVec in_vec = LoadPackedVec(in_vecs + inOffset);
+      PackedVec in_vec_up;
+      if constexpr (FUSE_SILU_MUL) {
+        in_vec_up = LoadPackedVec(in_vecs + colsPerRow + inOffset);
+      }
+
+      expert_idx = search_expert(
+          input_offsets, n_experts, expert_idx, static_cast<uint32_t>(rowIdx),
+          search_use_gallop && tile != static_cast<int>(blockIdx.x));
+      int const rowIdx_in_expert = rowIdx - input_offsets[expert_idx];
+      float const SFScaleVal = sf_scales[expert_idx];
+      uint32_t* const SFout_in_expert =
+          SFout + output_scale_offset[expert_idx] * numKTiles;
+
+      // Optionally apply fused SiLU+Mul
+      if constexpr (FUSE_SILU_MUL) {
+        in_vec = compute_silu_mul(in_vec, in_vec_up);
+      }
+
+      uint8_t sf;
+      u32x2 const o =
+          cvt_warp_fp16_to_fp4<Type, CVT_FP4_NUM_THREADS_PER_SF, UE8M0_SF>(
+              in_vec, SFScaleVal, &sf);
+      int const slot =
+          (rowInTile % kInnerRowStride) * 4 + rowInTile / kInnerRowStride;
+      tile_sf_bytes[slot * kVecsPerKTile + idx % kVecsPerKTile] = sf;
+      if (idx % kVecsPerKTile == 0) {
+        // colIdx starts the K chunk, so this is the row's word-aligned slot.
+        uint8_t const* const sf_out =
+            cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                               CVT_FP4_NUM_THREADS_PER_SF>(
+                rowIdx_in_expert, colIdx, numKTiles, SFout_in_expert);
+        tile_sf_dst[slot] = static_cast<uint32_t>(
+            (sf_out - reinterpret_cast<uint8_t const*>(SFout)) /
+            sizeof(uint32_t));
+        if (idx == 0) {
+          tile_first_row_in_expert = rowIdx_in_expert;
+        }
+      }
+
+      uint64_t* const out_row =
+          reinterpret_cast<uint64_t*>(out) + (int64_t)rowIdx * colsPerRow;
+      st64_cs(reinterpret_cast<int64_t*>(out_row + colIdx),
+              static_cast<int64_t>(static_cast<uint64_t>(o.hi) << 32 | o.lo));
+    }
+    __syncthreads();
+
+    // Write the tile's SFs a word per thread. In an SF tile, the word of row
+    // r sits at (r % 32) * 4 + (r / 32) % 4, so thread j takes the row whose
+    // row within its expert is congruent to (j % 4) * 32 + j / 4 modulo the
+    // tile height. Within one expert, consecutive threads then write
+    // consecutive words of at most two SF tiles; across experts this is still
+    // a permutation of the tile's rows.
+    if (threadIdx.x < CVT_FP4_SF_TILE_ROWS) {
+      int const j = threadIdx.x;
+      int const rowInSFTile = (j % 4) * kInnerRowStride + j / 4;
+      int const rowInTile =
+          (rowInSFTile - tile_first_row_in_expert) & (CVT_FP4_SF_TILE_ROWS - 1);
+      int const slot =
+          (rowInTile % kInnerRowStride) * 4 + rowInTile / kInnerRowStride;
+      int const chunkCols = min(kVecsPerKTile, colsPerRow - colBegin);
+      if (rowInTile < tileRows) {
+        if (chunkCols == kVecsPerKTile) {
+          SFout[tile_sf_dst[slot]] = tile_sf_words[slot];
+        } else {
+          // A partial K chunk writes only its real SFs.
+          uint8_t* const sf_row =
+              reinterpret_cast<uint8_t*>(SFout + tile_sf_dst[slot]);
+          for (int innerKIdx = 0; innerKIdx < chunkCols; ++innerKIdx) {
+            sf_row[innerKIdx] = tile_sf_bytes[slot * kVecsPerKTile + innerKIdx];
+          }
+        }
+      }
+    }
+    // The next tile reuses the staging buffers.
+    __syncthreads();
+  }
+}
+
+template <typename T, bool FUSE_SILU_MUL = false>
+void quant_impl(void* output, void* output_scale, void* input,
+                void* input_global_scale, void* input_offset_by_experts,
+                void* output_scale_offset_by_experts, int m_topk, int k,
+                int n_experts, cudaStream_t stream) {
+  if (m_topk == 0) return;
+
+  int multiProcessorCount = get_device_prop()->multiProcessorCount;
+
+  // One wave of blocks grid-striding over the tiles, capped at the tile count.
+  int64_t const max_tiles =
+      div_round_up((int64_t)m_topk, (int64_t)CVT_FP4_SF_TILE_ROWS) *
+      div_round_up(k, CVT_FP4_SF_TILE_COLS);
+  dim3 block(CVT_FP4_MAX_THREADS_PER_BLOCK);
+  size_t const shared_mem_size = expert_tables_smem_size(n_experts);
+  auto const kernel = cvt_fp16_to_fp4<T, FUSE_SILU_MUL, false>;
+  int numBlocksPerSM = 0;
+  STD_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &numBlocksPerSM, kernel, block.x, shared_mem_size));
+  dim3 grid(std::min<int64_t>(
+      max_tiles, (int64_t)multiProcessorCount * std::max(numBlocksPerSM, 1)));
+
+  kernel<<<grid, block, shared_mem_size, stream>>>(
+      m_topk, k, reinterpret_cast<T*>(input),
+      reinterpret_cast<float*>(input_global_scale),
+      reinterpret_cast<uint32_t*>(output),
+      reinterpret_cast<uint32_t*>(output_scale),
+      reinterpret_cast<uint32_t*>(input_offset_by_experts),
+      reinterpret_cast<uint32_t*>(output_scale_offset_by_experts), n_experts);
+}
+#elif NVFP4_EXPERTS_QUANT_LOCAL_OPTIMIZATION == 1
 template <class Type, bool FUSE_SILU_MUL = false, bool UE8M0_SF = false,
           bool STAGE_EXPERT_TABLES = true>
 __global__ void __launch_bounds__(
