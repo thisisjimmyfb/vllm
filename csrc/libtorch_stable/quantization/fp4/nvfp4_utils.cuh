@@ -268,9 +268,6 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
     SFValue = float(tmp);
   }
 
-  // Write the SF to global memory (STG.8).
-  if (SFout) *SFout = fp8SFVal;
-
   // Get the output scale (= 1 / SFValue for the MXFP4/UE8M0 path where
   // SFScaleVal=1).  Use exact division for UE8M0 to ensure bit-exact scaling
   // that matches the reference QDQ implementation (dividing by a power-of-2
@@ -287,18 +284,24 @@ __device__ __forceinline__ fp4_packed_t cvt_warp_fp16_to_fp4(
                       : 0.0f;
   }
 
+  float2 const outputScale2 = make_float2(outputScale, outputScale);
+
   // Convert the input to float.
   float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
 
 #pragma unroll
   for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++) {
-    fp2Vals[i] = cast_to_float2(vec.elts[i]);
-    fp2Vals[i].x *= outputScale;
-    fp2Vals[i].y *= outputScale;
+    fp2Vals[i] = __fmul2_rn(cast_to_float2(vec.elts[i]), outputScale2);
   }
 
   // Convert to e2m1 values.
-  return pack_fp4(fp2Vals);
+  fp4_packed_t const packed = pack_fp4(fp2Vals);
+
+  // Write the SF to global memory (STG.8). This comes after packing: the
+  // store needs its 64-bit address live, which before packing would be on top
+  // of all the input values and can spill.
+  if (SFout) *SFout = fp8SFVal;
+  return packed;
 }
 
 // silu in float32
